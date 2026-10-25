@@ -13,11 +13,12 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use crossterm::{cursor, queue, terminal};
 
 use config::Config;
+use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 /// Widths that Alt+r cycles through, as a share of the screen.
 const WIDTHS: [f32; 3] = [1.0 / 3.0, 0.5, 2.0 / 3.0];
@@ -32,6 +33,14 @@ const FRAME: Duration = Duration::from_millis(8);
 const QUEUE: usize = 64;
 /// Stack size for the small per-pane helper threads.
 const THREAD_STACK: usize = 64 * 1024;
+/// Lines each pane keeps after they scroll off the top.
+const SCROLLBACK: usize = 5000;
+/// Lines one wheel step scrolls.
+const WHEEL_LINES: usize = 3;
+/// Mouse reporting we ask the user's terminal for: clicks and wheel (1000), SGR form (1006).
+/// Not all-motion (1003), which would flood us with events.
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
 
 /// What pane threads tell the main loop.
 enum Ev {
@@ -277,7 +286,7 @@ impl App {
             }
         };
 
-        let pane = Pane { id, frac, parser: vt100::Parser::new(nz(rows), nz(cols), 0), master, child, input };
+        let pane = Pane { id, frac, parser: vt100::Parser::new(nz(rows), nz(cols), SCROLLBACK), master, child, input };
         let at = if self.panes.is_empty() { 0 } else { self.focus + 1 };
         self.panes.insert(at, pane);
         self.focus = at;
@@ -411,7 +420,8 @@ impl App {
         if self.shortcut(k) {
             return;
         }
-        let p = &self.panes[self.focus];
+        let p = &mut self.panes[self.focus];
+        p.parser.screen_mut().set_scrollback(0);
         let _ = p.input.send(encode(k, p.parser.screen().application_cursor()));
     }
 
@@ -419,13 +429,61 @@ impl App {
     /// for them (editors use this to avoid auto-indenting pasted code).
     fn paste(&mut self, text: String) {
         self.notice = None;
-        let p = &self.panes[self.focus];
+        let p = &mut self.panes[self.focus];
+        p.parser.screen_mut().set_scrollback(0);
         let bytes = if p.parser.screen().bracketed_paste() {
             format!("\x1b[200~{text}\x1b[201~").into_bytes()
         } else {
             text.into_bytes()
         };
         let _ = p.input.send(bytes);
+    }
+
+    /// The pane under screen cell (`x`, `y`), and the cell inside it.
+    fn pane_at(&self, x: u16, y: u16) -> Option<(usize, u16, u16)> {
+        let row = y.checked_sub(1).filter(|&r| r < self.rows())?;
+        let cam = self.cam().0.round() as i32;
+        let mut col_x = 0i32;
+        for (i, p) in self.panes.iter().enumerate() {
+            let w = self.col_w(p) as i32;
+            let c = x as i32 - (col_x - cam) - 1;
+            if (0..w - 2).contains(&c) {
+                return Some((i, c as u16, row));
+            }
+            col_x += w + GAP as i32;
+        }
+        None
+    }
+
+    /// Mouse over a pane. Apps that asked for the mouse get it. Otherwise the
+    /// wheel scrolls: arrow keys for full-screen apps (like xterm), scrollback for shells.
+    fn mouse(&mut self, m: MouseEvent) {
+        let Some((i, col, row)) = self.pane_at(m.column, m.row) else { return };
+        let p = &mut self.panes[i];
+        let screen = p.parser.screen();
+        let mode = screen.mouse_protocol_mode();
+        if mode != MouseProtocolMode::None {
+            // Mode Press wants no releases.
+            let skip = mode == MouseProtocolMode::Press && matches!(m.kind, MouseEventKind::Up(_));
+            let sgr = screen.mouse_protocol_encoding() == MouseProtocolEncoding::Sgr;
+            if let Some(bytes) = encode_mouse(m, col, row, sgr).filter(|_| !skip) {
+                let _ = p.input.send(bytes);
+            }
+            return;
+        }
+        let code = match m.kind {
+            MouseEventKind::ScrollUp => KeyCode::Up,
+            MouseEventKind::ScrollDown => KeyCode::Down,
+            _ => return,
+        };
+        if screen.alternate_screen() {
+            let key = encode(KeyEvent::new(code, KeyModifiers::NONE), screen.application_cursor());
+            let _ = p.input.send(key.repeat(WHEEL_LINES));
+        } else {
+            let n = screen.scrollback();
+            let n = if code == KeyCode::Up { n + WHEEL_LINES } else { n.saturating_sub(WHEEL_LINES) };
+            p.parser.screen_mut().set_scrollback(n);
+        }
     }
 
     fn handle(&mut self, e: Ev) {
@@ -444,6 +502,7 @@ impl App {
         match e {
             Event::Key(k) if !self.panes.is_empty() => self.key(k),
             Event::Paste(text) if !self.panes.is_empty() => self.paste(text),
+            Event::Mouse(m) if !self.panes.is_empty() => self.mouse(m),
             Event::Resize(w, h) => (self.w, self.h) = (w, h),
             _ => {}
         }
@@ -579,7 +638,7 @@ impl App {
             let s = p.parser.screen();
             let (cy, cx) = s.cursor_position();
             let sx = self.col_x(self.focus) as i32 + 1 + cx as i32 - cam;
-            if !s.hide_cursor() && (0..self.w as i32).contains(&sx) {
+            if !s.hide_cursor() && s.scrollback() == 0 && (0..self.w as i32).contains(&sx) {
                 queue!(out, cursor::MoveTo(sx as u16, cy + 1), cursor::Show)?;
             }
         }
@@ -649,10 +708,37 @@ fn encode(k: KeyEvent, app_cursor: bool) -> Vec<u8> {
     out
 }
 
+/// Turn a mouse event at a pane cell (`col`, `row`, from 0) into the bytes
+/// xterm would send. None for events we don't pass on.
+fn encode_mouse(m: MouseEvent, col: u16, row: u16, sgr: bool) -> Option<Vec<u8>> {
+    let btn = |b| match b {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    };
+    let (code, release) = match m.kind {
+        MouseEventKind::Down(b) => (btn(b), false),
+        MouseEventKind::Up(b) => (btn(b), true),
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        _ => return None,
+    };
+    let mods = m.modifiers;
+    let code = code + 4 * mods.contains(KeyModifiers::SHIFT) as u8 + 8 * mods.contains(KeyModifiers::ALT) as u8 + 16 * mods.contains(KeyModifiers::CONTROL) as u8;
+    Some(if sgr {
+        format!("\x1b[<{code};{};{}{}", col + 1, row + 1, if release { 'm' } else { 'M' }).into_bytes()
+    } else {
+        // The old form can't say which button was let go, and can't reach past cell 222.
+        let code = if release { code | 3 } else { code };
+        let pos = |n: u16| n.min(222) as u8 + 33;
+        vec![0x1b, b'[', b'M', code + 32, pos(col), pos(row)]
+    })
+}
+
 /// Give the user's terminal back in its normal state.
 fn restore() {
     let _ = terminal::disable_raw_mode();
-    let _ = crossterm::execute!(io::stdout(), event::DisableBracketedPaste, terminal::LeaveAlternateScreen, cursor::Show);
+    let _ = crossterm::execute!(io::stdout(), Print(MOUSE_OFF), event::DisableBracketedPaste, terminal::LeaveAlternateScreen, cursor::Show);
 }
 
 fn main() -> io::Result<()> {
@@ -679,7 +765,7 @@ fn main() -> io::Result<()> {
     app.spawn()?;
 
     terminal::enable_raw_mode()?;
-    crossterm::execute!(io::stdout(), terminal::EnterAlternateScreen, event::EnableBracketedPaste)?;
+    crossterm::execute!(io::stdout(), terminal::EnterAlternateScreen, event::EnableBracketedPaste, Print(MOUSE_ON))?;
     // Fix the terminal even if we crash.
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -762,7 +848,8 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, Glyph, number_window, scroll_to, spring};
+    use super::{Frame, Glyph, encode_mouse, number_window, scroll_to, spring};
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     #[test]
     fn numbers_window() {
@@ -778,6 +865,16 @@ mod tests {
         assert_eq!(number_window(40, 39, 10).1, 39);
     }
     use crossterm::style::Color;
+
+    #[test]
+    fn mouse_bytes() {
+        let ev = |kind| MouseEvent { kind, column: 0, row: 0, modifiers: KeyModifiers::NONE };
+        assert_eq!(encode_mouse(ev(MouseEventKind::ScrollUp), 4, 2, true).unwrap(), b"\x1b[<64;5;3M");
+        assert_eq!(encode_mouse(ev(MouseEventKind::Up(MouseButton::Right)), 0, 0, true).unwrap(), b"\x1b[<2;1;1m");
+        assert_eq!(encode_mouse(ev(MouseEventKind::Down(MouseButton::Left)), 0, 0, false).unwrap(), b"\x1b[M !!");
+        assert_eq!(encode_mouse(ev(MouseEventKind::Up(MouseButton::Left)), 0, 0, false).unwrap(), b"\x1b[M#!!");
+        assert!(encode_mouse(ev(MouseEventKind::Moved), 0, 0, true).is_none());
+    }
 
     #[test]
     fn scroll() {
