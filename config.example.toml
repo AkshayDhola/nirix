@@ -1,0 +1,7 @@
+# nirix config: copy to ~/.config/nirix/config.toml
+focus_color = "blue"
+border_color = "bright-black"
+
+# Camera slide when focus moves.
+animation = true
+animation_ms = 250
