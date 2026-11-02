@@ -1,32 +1,43 @@
-#!/bin/sh
-# Build nirix and install it to ~/.local/bin (override with BIN_DIR=...).
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
 
-cd "$(dirname "$0")"
+OWNER="AkshayDhola"
+REPO="nirix"
+BINARY="nirix"
+ASSET="${BINARY}-linux-x86_64.tar.gz"
 
-if ! command -v cargo >/dev/null 2>&1; then
-    echo "nirix: cargo not found. Install Rust first: https://rustup.rs" >&2
+DOWNLOAD_URL="https://github.com/${OWNER}/${REPO}/releases/latest/download/${ASSET}"
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+echo "Downloading latest ${BINARY} release..."
+
+curl -fL "$DOWNLOAD_URL" -o "$TMP_DIR/app.tar.gz"
+
+tar -xzf "$TMP_DIR/app.tar.gz" -C "$TMP_DIR"
+
+if [[ ! -f "$TMP_DIR/$BINARY" ]]; then
+    echo "Error: binary not found in release archive"
     exit 1
 fi
 
-BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nirix"
+chmod +x "$TMP_DIR/$BINARY"
 
-cargo build --release --locked
-
-mkdir -p "$BIN_DIR"
-cp target/release/nirix "$BIN_DIR/nirix"
-chmod 755 "$BIN_DIR/nirix"
-echo "installed $BIN_DIR/nirix"
-
-# never overwrite a config the user already has
-if [ ! -f "$CONFIG_DIR/config.toml" ]; then
-    mkdir -p "$CONFIG_DIR"
-    cp config.example.toml "$CONFIG_DIR/config.toml"
-    echo "created $CONFIG_DIR/config.toml"
+# Install globally if possible; otherwise use user's local bin.
+if [[ -w /usr/local/bin ]]; then
+    INSTALL_DIR="/usr/local/bin"
+elif command -v sudo >/dev/null 2>&1; then
+    INSTALL_DIR="/usr/local/bin"
+    sudo install -m 755 "$TMP_DIR/$BINARY" "$INSTALL_DIR/$BINARY"
+    echo "Installed ${BINARY} to ${INSTALL_DIR}"
+    exit 0
+else
+    INSTALL_DIR="${HOME}/.local/bin"
+    mkdir -p "$INSTALL_DIR"
 fi
 
-case ":$PATH:" in
-    *":$BIN_DIR:"*) ;;
-    *) echo "note: $BIN_DIR is not in PATH; add it to your shell profile" ;;
-esac
+install -m 755 "$TMP_DIR/$BINARY" "$INSTALL_DIR/$BINARY"
+
+echo "Successfully installed ${BINARY}"
+echo "Location: ${INSTALL_DIR}/${BINARY}"

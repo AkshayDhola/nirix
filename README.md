@@ -1,49 +1,36 @@
 # nirix
 
-A terminal multiplexer that scrolls, like the [niri](https://github.com/niri-wm/niri) window manager.
+A scrolling terminal multiplexer, inspired by [niri](https://github.com/niri-wm/niri).
 
-Each terminal is a column. A new one opens to the right and the view slides over to it, so the others never shrink.
-
-```
-  ┌───────┐ ┌───────────────────────┐ ┌───────┐
-  │ term 1│ │ term 2    │ term 3    │ │ term 4│
-  └───────┘ └───────────────────────┘ └───────┘
-   off screen        on screen         off screen
-```
+Each terminal is a column. New terminals open to the right, and the view scrolls to them.
 
 ## Install
 
-You need [Rust](https://rustup.rs). Works on Linux and macOS.
+Linux only. Run the same command again to update.
 
 ```sh
-git clone https://github.com/AkshayDhola/nirix
-cd nirix
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/AkshayDhola/nirix/main/install.sh | bash
 ```
-
-This puts `nirix` in `~/.local/bin` and creates a config file at `~/.config/nirix/config.toml`.
 
 ## Keys
 
 | Key | Action |
 |---|---|
-| `Alt+Enter` | New terminal |
-| `Alt+Left` / `Alt+Right` | Focus left / right |
-| `Alt+Shift+Left` / `Alt+Shift+Right` | Move terminal left / right |
-| `Alt+1` … `Alt+9` | Jump to terminal |
+| `Alt+Enter`, `Alt+n` | New terminal |
+| `Alt+Left`, `Alt+Right` | Focus left or right |
+| `Alt+Shift+Left`, `Alt+Shift+Right` | Move terminal left or right |
+| `Alt+1` to `Alt+9` | Jump to terminal |
 | `Alt+r` | Change width |
 | `Alt+m` | Full width |
 | `Alt+x` | Close terminal |
 
-`Alt+n` also opens a terminal, and `Alt+h/l` (`Alt+H/L` to move) work like the arrow keys.
-
 ## Config
 
-`~/.config/nirix/config.toml`. Every setting is optional.
+Optional file at `~/.config/nirix/config.toml`:
 
 ```toml
 shell = "/usr/bin/zsh"
-focus_color = "blue"          # color name, bright-<name>, 0-255, or "#rrggbb"
+focus_color = "blue"          # name, bright-<name>, 0-255, or "#rrggbb"
 border_color = "bright-black"
 animation = true
 animation_ms = 250

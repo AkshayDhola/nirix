@@ -8,7 +8,7 @@ mod pty;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::num::NonZeroU16;
-use std::process::Child;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,10 +37,14 @@ const THREAD_STACK: usize = 64 * 1024;
 const SCROLLBACK: usize = 5000;
 /// Lines one wheel step scrolls.
 const WHEEL_LINES: usize = 3;
-/// Mouse reporting we ask the user's terminal for: clicks and wheel (1000), SGR form (1006).
+/// Mouse reporting we ask the user's terminal for: clicks, wheel and drags (1002), SGR form (1006).
 /// Not all-motion (1003), which would flood us with events.
-const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
-const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
+const MOUSE_ON: &str = "\x1b[?1002h\x1b[?1006h";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l";
+/// Longest gap between clicks of a double or triple click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// What ends a word for double-click (same as Alacritty).
+const WORD_SEP: &str = ",│`|:\"' ()[]{}<>\t";
 
 /// What pane threads tell the main loop.
 enum Ev {
@@ -58,11 +62,40 @@ struct Pane {
     id: u64,
     /// Width as a share of the screen.
     frac: f32,
-    parser: vt100::Parser,
+    parser: vt100::Parser<Clip>,
     master: File,
     child: Child,
     /// Key presses for this pane, written to its shell by a helper thread.
     input: Sender<Vec<u8>>,
+}
+
+/// Keeps what an app copied (OSC 52, already base64) so we can pass it to the real terminal.
+#[derive(Default)]
+struct Clip(Option<String>);
+
+impl vt100::Callbacks for Clip {
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
+        self.0 = Some(String::from_utf8_lossy(data).into_owned());
+    }
+}
+
+/// Text picked with the mouse, in one pane. Lines count from the oldest
+/// scrollback line, so the selection stays on its text while output scrolls.
+/// ponytail: drifts once scrollback is full and old lines drop off.
+#[derive(Clone, Copy)]
+struct Sel {
+    pane: u64,
+    anchor: (usize, u16),
+    /// None until the mouse moves: a plain click selects nothing.
+    head: Option<(usize, u16)>,
+}
+
+impl Sel {
+    /// Both ends in reading order, if anything is selected.
+    fn range(&self) -> Option<((usize, u16), (usize, u16))> {
+        let head = self.head?;
+        Some((self.anchor.min(head), self.anchor.max(head)))
+    }
 }
 
 /// Where the view was, and how fast it moved, when the current slide began.
@@ -170,6 +203,13 @@ struct App {
     tx: SyncSender<Ev>,
     /// Error to show in the status bar until the next key press.
     notice: Option<String>,
+    sel: Option<Sel>,
+    /// Pane a mouse button went down in; its drags and release go there too.
+    held: Option<u64>,
+    /// Time, screen cell and count of the last left click, to spot double and triple clicks.
+    last_click: Option<(Instant, (u16, u16), u8)>,
+    /// Base64 text to put on the real terminal's clipboard with the next frame.
+    clip: Option<String>,
 }
 
 /// Scroll as little as possible so the column at `col_x` (width `col_w`) fits on screen.
@@ -273,7 +313,9 @@ impl App {
         let frac = 0.5;
         let cols = if self.panes.is_empty() { self.w.max(MIN_COL) } else { self.frac_w(frac) } - 2;
         let rows = self.rows();
-        let (master, mut child) = pty::spawn(&self.cfg.shell, rows, cols)?;
+        // Start where the focused shell is, like a normal terminal's new window.
+        let dir = self.panes.get(self.focus).and_then(|p| std::fs::read_link(format!("/proc/{}/cwd", p.child.id())).ok()).filter(|d| d.is_dir());
+        let (master, mut child) = pty::spawn(&self.cfg.shell, rows, cols, dir)?;
         // Take the id even if the next step fails, so a late Exit for it can't hit another pane.
         let id = self.next_id;
         self.next_id += 1;
@@ -286,7 +328,8 @@ impl App {
             }
         };
 
-        let pane = Pane { id, frac, parser: vt100::Parser::new(nz(rows), nz(cols), SCROLLBACK), master, child, input };
+        let parser = vt100::Parser::new_with_callbacks(nz(rows), nz(cols), SCROLLBACK, Clip::default());
+        let pane = Pane { id, frac, parser, master, child, input };
         let at = if self.panes.is_empty() { 0 } else { self.focus + 1 };
         self.panes.insert(at, pane);
         self.focus = at;
@@ -344,7 +387,16 @@ impl App {
             let p = &mut self.panes[i];
             let (r, c) = p.parser.screen().size();
             if (r.get(), c.get()) != (rows, cols) {
-                p.parser.set_size(nz(rows), nz(cols));
+                // Its lines are about to move.
+                if self.sel.is_some_and(|s| s.pane == p.id) {
+                    self.sel = None;
+                }
+                // Full-screen apps redraw themselves; shell output is re-wrapped.
+                if c.get() != cols && !p.parser.screen().alternate_screen() {
+                    p.parser = reflow(&mut p.parser, rows, cols);
+                } else {
+                    p.parser.set_size(nz(rows), nz(cols));
+                }
                 let _ = pty::resize(&p.master, rows, cols);
             }
         }
@@ -417,6 +469,7 @@ impl App {
             return;
         }
         self.notice = None;
+        self.sel = None;
         if self.shortcut(k) {
             return;
         }
@@ -429,6 +482,7 @@ impl App {
     /// for them (editors use this to avoid auto-indenting pasted code).
     fn paste(&mut self, text: String) {
         self.notice = None;
+        self.sel = None;
         let p = &mut self.panes[self.focus];
         p.parser.screen_mut().set_scrollback(0);
         let bytes = if p.parser.screen().bracketed_paste() {
@@ -439,50 +493,127 @@ impl App {
         let _ = p.input.send(bytes);
     }
 
-    /// The pane under screen cell (`x`, `y`), and the cell inside it.
-    fn pane_at(&self, x: u16, y: u16) -> Option<(usize, u16, u16)> {
-        let row = y.checked_sub(1).filter(|&r| r < self.rows())?;
+    /// Cell (`col`, `row`) of pane `i` under screen cell (`x`, `y`). Can be outside the pane.
+    fn cell_in(&self, i: usize, x: u16, y: u16) -> (i32, i32) {
         let cam = self.cam().0.round() as i32;
-        let mut col_x = 0i32;
-        for (i, p) in self.panes.iter().enumerate() {
-            let w = self.col_w(p) as i32;
-            let c = x as i32 - (col_x - cam) - 1;
-            if (0..w - 2).contains(&c) {
-                return Some((i, c as u16, row));
-            }
-            col_x += w + GAP as i32;
-        }
-        None
+        (x as i32 - (self.col_x(i) as i32 - cam) - 1, y as i32 - 1)
     }
 
-    /// Mouse over a pane. Apps that asked for the mouse get it. Otherwise the
-    /// wheel scrolls: arrow keys for full-screen apps (like xterm), scrollback for shells.
+    /// The pane under screen cell (`x`, `y`), and the cell inside it.
+    fn pane_at(&self, x: u16, y: u16) -> Option<(usize, u16, u16)> {
+        (0..self.panes.len()).find_map(|i| {
+            let (c, r) = self.cell_in(i, x, y);
+            let inner = self.col_w(&self.panes[i]) as i32 - 2;
+            ((0..inner).contains(&c) && (0..self.rows() as i32).contains(&r)).then_some((i, c as u16, r as u16))
+        })
+    }
+
+    /// Mouse over a pane. A click focuses it. Apps that asked for the mouse get
+    /// it. Otherwise dragging selects text (copied on release), and the wheel
+    /// scrolls: arrow keys for full-screen apps (like xterm), scrollback for shells.
     fn mouse(&mut self, m: MouseEvent) {
-        let Some((i, col, row)) = self.pane_at(m.column, m.row) else { return };
+        let (i, col, row) = match m.kind {
+            // Drags and the release go to the pane the button went down in, even past its edge.
+            MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
+                let Some(i) = self.panes.iter().position(|p| Some(p.id) == self.held) else { return };
+                let (c, r) = self.cell_in(i, m.column, m.row);
+                (i, c, r)
+            }
+            _ => {
+                let Some((i, c, r)) = self.pane_at(m.column, m.row) else { return };
+                (i, c as i32, r as i32)
+            }
+        };
+        let rows = self.rows() as i32;
+        let c = col.clamp(0, self.col_w(&self.panes[i]) as i32 - 3) as u16;
+        let r = row.clamp(0, rows - 1) as u16;
+        match m.kind {
+            MouseEventKind::Down(b) => {
+                self.held = Some(self.panes[i].id);
+                if b == MouseButton::Left {
+                    self.focus = i;
+                    self.sel = None;
+                }
+            }
+            MouseEventKind::Up(_) => self.held = None,
+            _ => {}
+        }
         let p = &mut self.panes[i];
         let screen = p.parser.screen();
+        // Ctrl+click opens a link, even in apps that use the mouse.
+        if m.kind == MouseEventKind::Down(MouseButton::Left)
+            && m.modifiers.contains(KeyModifiers::CONTROL)
+            && let Some(url) = url_at(screen, r, c)
+        {
+            if let Err(e) = open_url(&url) {
+                self.notice = Some(format!("can't open link: {e}"));
+            }
+            return;
+        }
         let mode = screen.mouse_protocol_mode();
         if mode != MouseProtocolMode::None {
-            // Mode Press wants no releases.
-            let skip = mode == MouseProtocolMode::Press && matches!(m.kind, MouseEventKind::Up(_));
+            // Mode Press wants no releases; only the motion modes want drags.
+            let skip = match m.kind {
+                MouseEventKind::Up(_) => mode == MouseProtocolMode::Press,
+                MouseEventKind::Drag(_) => matches!(mode, MouseProtocolMode::Press | MouseProtocolMode::PressRelease),
+                _ => false,
+            };
             let sgr = screen.mouse_protocol_encoding() == MouseProtocolEncoding::Sgr;
-            if let Some(bytes) = encode_mouse(m, col, row, sgr).filter(|_| !skip) {
+            if let Some(bytes) = encode_mouse(m, c, r, sgr).filter(|_| !skip) {
                 let _ = p.input.send(bytes);
             }
             return;
         }
-        let code = match m.kind {
-            MouseEventKind::ScrollUp => KeyCode::Up,
-            MouseEventKind::ScrollDown => KeyCode::Down,
-            _ => return,
-        };
-        if screen.alternate_screen() {
-            let key = encode(KeyEvent::new(code, KeyModifiers::NONE), screen.application_cursor());
-            let _ = p.input.send(key.repeat(WHEEL_LINES));
-        } else {
-            let n = screen.scrollback();
-            let n = if code == KeyCode::Up { n + WHEEL_LINES } else { n.saturating_sub(WHEEL_LINES) };
-            p.parser.screen_mut().set_scrollback(n);
+        let id = p.id;
+        let s = p.parser.screen_mut();
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let n = match self.last_click {
+                    Some((t, at, n)) if at == (m.column, m.row) && t.elapsed() < DOUBLE_CLICK => n % 3 + 1,
+                    _ => 1,
+                };
+                self.last_click = Some((Instant::now(), (m.column, m.row), n));
+                let top = line_of(s, 0);
+                let (anchor, head) = match n {
+                    2 => {
+                        let (a, b) = word_at(s, r, c);
+                        ((top + r as usize, a), Some((top + r as usize, b)))
+                    }
+                    3 => {
+                        let (a, b) = line_rows(s, r);
+                        ((top + a as usize, 0), Some((top + b as usize, s.size().1.get() - 1)))
+                    }
+                    _ => ((top + r as usize, c), None),
+                };
+                self.sel = Some(Sel { pane: id, anchor, head });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                // Past the top or bottom edge: scroll the history along.
+                // ponytail: one line per mouse move; add a timer if that feels slow.
+                if row < 0 {
+                    s.set_scrollback(s.scrollback() + 1);
+                } else if row >= rows {
+                    s.set_scrollback(s.scrollback().saturating_sub(1));
+                }
+                if let Some(sel) = self.sel.as_mut().filter(|x| x.pane == id) {
+                    sel.head = Some((line_of(s, r), c));
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => match self.sel.filter(|x| x.pane == id).and_then(|x| x.range()) {
+                Some((a, b)) => self.clip = Some(base64(selected_text(s, a, b).as_bytes())),
+                None => self.sel = None,
+            },
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = m.kind == MouseEventKind::ScrollUp;
+                if s.alternate_screen() {
+                    let key = encode(KeyEvent::new(if up { KeyCode::Up } else { KeyCode::Down }, KeyModifiers::NONE), s.application_cursor());
+                    let _ = p.input.send(key.repeat(WHEEL_LINES));
+                } else {
+                    let n = s.scrollback();
+                    s.set_scrollback(if up { n + WHEEL_LINES } else { n.saturating_sub(WHEEL_LINES) });
+                }
+            }
+            _ => {}
         }
     }
 
@@ -491,6 +622,9 @@ impl App {
             Ev::Out(id, bytes) => {
                 if let Some(p) = self.panes.iter_mut().find(|p| p.id == id) {
                     p.parser.process(&bytes);
+                    if let Some(data) = p.parser.callbacks_mut().0.take() {
+                        self.clip = Some(data);
+                    }
                 }
             }
             Ev::Exit(id) => self.remove(id),
@@ -538,6 +672,8 @@ impl App {
             }
 
             let screen = p.parser.screen();
+            let top = line_of(screen, 0);
+            let sel = self.sel.filter(|s| s.pane == p.id).and_then(|s| s.range());
             let inner = w - 2;
             for y in 0..rows {
                 for c in 0..inner {
@@ -554,10 +690,11 @@ impl App {
                         }
                         continue;
                     }
+                    let selected = sel.is_some_and(|(a, b)| (a..=b).contains(&(top + y as usize, c as u16)));
                     let attrs = (cell.bold() as u8 * BOLD)
                         | (cell.italic() as u8 * ITALIC)
                         | (cell.underline() as u8 * UNDERLINE)
-                        | (cell.inverse() as u8 * REVERSE);
+                        | ((cell.inverse() != selected) as u8 * REVERSE);
                     // A wide character with no room for its right half becomes a blank.
                     let cut = cell.is_wide() && (c + 1 >= inner || sx + 1 >= sw);
                     let s = if cut || cell.contents().is_empty() { " " } else { cell.contents() };
@@ -642,6 +779,10 @@ impl App {
                 queue!(out, cursor::MoveTo(sx as u16, cy + 1), cursor::Show)?;
             }
         }
+        // Copied text goes to the real terminal's clipboard (OSC 52).
+        if let Some(data) = self.clip.take() {
+            queue!(out, Print(format!("\x1b]52;c;{data}\x07")))?;
+        }
         queue!(out, terminal::EndSynchronizedUpdate)?;
         // The new frame is now on screen; the old one becomes the spare.
         self.next = std::mem::replace(&mut self.prev, f);
@@ -719,6 +860,7 @@ fn encode_mouse(m: MouseEvent, col: u16, row: u16, sgr: bool) -> Option<Vec<u8>>
     let (code, release) = match m.kind {
         MouseEventKind::Down(b) => (btn(b), false),
         MouseEventKind::Up(b) => (btn(b), true),
+        MouseEventKind::Drag(b) => (btn(b) + 32, false),
         MouseEventKind::ScrollUp => (64, false),
         MouseEventKind::ScrollDown => (65, false),
         _ => return None,
@@ -732,6 +874,193 @@ fn encode_mouse(m: MouseEvent, col: u16, row: u16, sgr: bool) -> Option<Vec<u8>>
         let code = if release { code | 3 } else { code };
         let pos = |n: u16| n.min(222) as u8 + 33;
         vec![0x1b, b'[', b'M', code + 32, pos(col), pos(row)]
+    })
+}
+
+/// SGR code that sets exactly this cell's colors and style.
+fn sgr(c: &vt100::Cell) -> String {
+    let mut out = String::from("\x1b[0");
+    for (on, code) in [(c.bold(), ";1"), (c.dim(), ";2"), (c.italic(), ";3"), (c.underline(), ";4"), (c.inverse(), ";7")] {
+        if on {
+            out.push_str(code);
+        }
+    }
+    for (color, base) in [(c.fgcolor(), 38), (c.bgcolor(), 48)] {
+        match color {
+            vt100::Color::Default => {}
+            vt100::Color::Idx(i) => out.push_str(&format!(";{base};5;{i}")),
+            vt100::Color::Rgb(r, g, b) => out.push_str(&format!(";{base};2;{r};{g};{b}")),
+        }
+    }
+    out.push('m');
+    out
+}
+
+/// Rebuild a screen at a new size so long lines wrap to the new width, like a
+/// real terminal. vt100 only cuts or pads rows, so we replay the old text
+/// (scrollback included) into a new parser.
+fn reflow<CB: vt100::Callbacks + Default>(old: &mut vt100::Parser<CB>, rows: u16, cols: u16) -> vt100::Parser<CB> {
+    let s = old.screen_mut();
+    let (h, w) = (s.size().0.get() as usize, s.size().1.get());
+    let sb = s.scrollback_len();
+    let (cy, cx) = s.cursor_position();
+    let cursor = sb + cy as usize;
+    let mut text = String::new();
+    // Where the cursor is in `text`.
+    let mut split = 0;
+    // Line ends not written yet; those after the last text are dropped.
+    let mut breaks = 0;
+    let mut style = None;
+    // Walk the old rows a screenful at a time; the last page is the live screen.
+    let mut top = 0;
+    while top < sb + h {
+        let first = top.min(sb);
+        s.set_scrollback(sb - first);
+        for r in (top - first) as u16..h as u16 {
+            let at_cursor = first + r as usize == cursor;
+            let wrapped = s.row_wrapped(r);
+            let shown = |c| s.cell(r, c).is_some_and(|x| x.has_contents() || x.bgcolor() != vt100::Color::Default || x.inverse());
+            let end = if wrapped { w } else { (0..w).rev().find(|&c| shown(c)).map_or(0, |c| c + 1) };
+            for c in 0..end.max(if at_cursor { cx + 1 } else { 0 }) {
+                if at_cursor && c == cx {
+                    text.push_str(&"\r\n".repeat(std::mem::take(&mut breaks)));
+                    split = text.len();
+                    if c >= end {
+                        break;
+                    }
+                }
+                let Some(cell) = s.cell(r, c) else { break };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                text.push_str(&"\r\n".repeat(std::mem::take(&mut breaks)));
+                let key = (cell.fgcolor(), cell.bgcolor(), cell.bold(), cell.dim(), cell.italic(), cell.underline(), cell.inverse());
+                if style != Some(key) {
+                    text.push_str(&sgr(cell));
+                    style = Some(key);
+                }
+                text.push_str(if cell.has_contents() { cell.contents() } else { " " });
+            }
+            if !wrapped {
+                breaks += 1;
+            }
+        }
+        top = first + h;
+    }
+    s.set_scrollback(0);
+
+    let mut new = vt100::Parser::new_with_callbacks(nz(rows), nz(cols), SCROLLBACK, CB::default());
+    new.process(&text.as_bytes()[..split]);
+    let (r, c) = new.screen().cursor_position();
+    let before = new.screen().scrollback_len();
+    new.process(&text.as_bytes()[split..]);
+    // Text after the cursor may have scrolled the screen up.
+    // ponytail: miscounts once scrollback is full; only matters for text below the cursor.
+    let r = (r as usize).saturating_sub(new.screen().scrollback_len() - before);
+    let hide = if s.hide_cursor() { "\x1b[?25l" } else { "" };
+    let restore = format!("\x1b[0m{}{}{hide}\x1b[{};{}H", s.attributes_formatted(), s.input_mode_formatted(), r + 1, c + 1);
+    new.process(restore.as_bytes());
+    new
+}
+
+/// Which line (counted from the oldest scrollback line) screen row `row` shows.
+fn line_of(s: &vt100::Screen, row: u16) -> usize {
+    s.scrollback_len() - s.scrollback() + row as usize
+}
+
+/// First and last screen row of the line `row` is part of, following wraps.
+fn line_rows(s: &vt100::Screen, row: u16) -> (u16, u16) {
+    let h = s.size().0.get();
+    let mut top = row;
+    while top > 0 && s.row_wrapped(top - 1) {
+        top -= 1;
+    }
+    let mut bot = row;
+    while bot + 1 < h && s.row_wrapped(bot) {
+        bot += 1;
+    }
+    (top, bot)
+}
+
+/// First and last column of the word at (`row`, `col`). Off a word, just that cell.
+fn word_at(s: &vt100::Screen, row: u16, col: u16) -> (u16, u16) {
+    let w = s.size().1.get();
+    let word = |c| s.cell(row, c).is_some_and(|x| x.is_wide_continuation() || (x.has_contents() && !WORD_SEP.contains(x.contents())));
+    if !word(col) {
+        return (col, col);
+    }
+    let start = (0..col).rev().find(|&c| !word(c)).map_or(0, |c| c + 1);
+    let end = (col + 1..w).find(|&c| !word(c)).map_or(w - 1, |c| c - 1);
+    (start, end)
+}
+
+/// Text from `a` to `b` (both included, `a` first), like a normal terminal
+/// copies it: wrapped rows join up and spaces at line ends are dropped.
+fn selected_text(s: &mut vt100::Screen, a: (usize, u16), b: (usize, u16)) -> String {
+    let (sb, keep, w) = (s.scrollback_len(), s.scrollback(), s.size().1.get());
+    let mut out = String::new();
+    for line in a.0..=b.0 {
+        // Bring the line on screen: the top row while it is in the history.
+        let (off, row) = if line < sb { (sb - line, 0) } else { (0, line - sb) };
+        s.set_scrollback(off);
+        let c0 = if line == a.0 { a.1 } else { 0 };
+        let c1 = if line == b.0 { b.1 + 1 } else { w };
+        let text = s.rows(c0, c1.saturating_sub(c0)).nth(row).unwrap_or_default();
+        let wrapped = s.row_wrapped(row as u16);
+        out.push_str(if wrapped { &text } else { text.trim_end() });
+        if line != b.0 && !wrapped {
+            out.push('\n');
+        }
+    }
+    s.set_scrollback(keep);
+    out
+}
+
+/// Standard base64, for OSC 52.
+fn base64(data: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | ((b as u32) << (16 - 8 * i)));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { ABC[((n >> (18 - 6 * i)) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+/// The link under screen cell (`row`, `col`), following lines that wrap.
+fn url_at(s: &vt100::Screen, row: u16, col: u16) -> Option<String> {
+    let w = s.size().1.get();
+    let (top, bot) = line_rows(s, row);
+    // One byte per cell; anything that can't be part of a link becomes a space.
+    let line: Vec<u8> = (top..=bot)
+        .flat_map(|r| (0..w).map(move |c| s.cell(r, c).map(vt100::Cell::contents)))
+        .map(|t| match t.map(str::as_bytes) {
+            Some(&[b]) if b.is_ascii_graphic() && !b"<>\"'`{}|\\^".contains(&b) => b,
+            _ => b' ',
+        })
+        .collect();
+    let at = (row - top) as usize * w as usize + col as usize;
+    if line.get(at).is_none_or(|&b| b == b' ') {
+        return None;
+    }
+    let start = line[..at].iter().rposition(|&b| b == b' ').map_or(0, |i| i + 1);
+    let end = line[at..].iter().position(|&b| b == b' ').map_or(line.len(), |i| at + i);
+    let word = std::str::from_utf8(&line[start..end]).ok()?;
+    let i = word.find("://")?;
+    let scheme = word[..i].rfind(|c: char| !c.is_ascii_alphanumeric()).map_or(0, |j| j + 1);
+    let url = word[scheme..].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']']);
+    (i > scheme && url.len() > i - scheme + 3).then(|| url.to_string())
+}
+
+/// Open a link with the desktop's default app, in the background.
+fn open_url(url: &str) -> io::Result<()> {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let mut child = Command::new(opener).arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    // Reap it so it doesn't linger as a zombie.
+    small_thread(move || {
+        let _ = child.wait();
     })
 }
 
@@ -761,6 +1090,10 @@ fn main() -> io::Result<()> {
         next_id: 0,
         tx: tx.clone(),
         notice: None,
+        sel: None,
+        held: None,
+        last_click: None,
+        clip: None,
     };
     app.spawn()?;
 
@@ -848,8 +1181,61 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, Glyph, encode_mouse, number_window, scroll_to, spring};
+    use super::{Frame, Glyph, base64, encode_mouse, line_of, number_window, nz, reflow, scroll_to, selected_text, spring, url_at, word_at};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    fn rows(p: &vt100::Parser) -> Vec<String> {
+        p.screen().rows(0, 100).map(|r| r.trim_end().to_string()).collect()
+    }
+
+    #[test]
+    fn reflows() {
+        let mut p = vt100::Parser::new(nz(3), nz(10), 100);
+        p.process(b"1\r\n2\r\n3\r\nabcdefghijklmno\r\n$ ");
+        // wider: the long line joins up, one old line goes back on screen
+        let mut q = reflow(&mut p, 3, 20);
+        assert_eq!(rows(&q), ["3", "abcdefghijklmno", "$"]);
+        assert_eq!(q.screen().cursor_position(), (2, 2));
+        assert_eq!(q.screen().scrollback_len(), 2);
+        // narrower: it wraps again
+        let q = reflow(&mut q, 3, 4);
+        assert_eq!(rows(&q), ["ijkl", "mno", "$"]);
+        assert_eq!(q.screen().cursor_position(), (2, 2));
+    }
+
+    #[test]
+    fn links() {
+        let mut p = vt100::Parser::new(nz(3), nz(10), 0);
+        p.process(b"see https://ex.com/abc. ok");
+        let s = p.screen();
+        // the link wraps over three rows; any part of it works
+        assert_eq!(url_at(s, 1, 3).as_deref(), Some("https://ex.com/abc"));
+        assert_eq!(url_at(s, 0, 5).as_deref(), Some("https://ex.com/abc"));
+        assert_eq!(url_at(s, 0, 0), None);
+        assert_eq!(url_at(s, 0, 3), None);
+    }
+
+    #[test]
+    fn selection() {
+        let mut p = vt100::Parser::new(nz(3), nz(10), 100);
+        p.process(b"one  \r\ntwo\r\nabcdefghijklmn\r\n$ ");
+        let s = p.screen_mut();
+        // lines: 0 "one", 1 "two" (history), 2+3 one wrapped line, 4 "$"
+        assert_eq!(selected_text(s, (0, 1), (3, 1)), "ne\ntwo\nabcdefghijkl");
+        assert_eq!(s.scrollback(), 0);
+        s.set_scrollback(1);
+        assert_eq!(line_of(s, 0), 1);
+
+        let mut p = vt100::Parser::new(nz(1), nz(20), 0);
+        p.process(b"foo bar:baz");
+        assert_eq!(word_at(p.screen(), 0, 5), (4, 6));
+        assert_eq!(word_at(p.screen(), 0, 9), (8, 10));
+        assert_eq!(word_at(p.screen(), 0, 3), (3, 3));
+
+        assert_eq!(base64(b"M"), "TQ==");
+        assert_eq!(base64(b"Ma"), "TWE=");
+        assert_eq!(base64(b"Man"), "TWFu");
+    }
 
     #[test]
     fn numbers_window() {
@@ -873,6 +1259,7 @@ mod tests {
         assert_eq!(encode_mouse(ev(MouseEventKind::Up(MouseButton::Right)), 0, 0, true).unwrap(), b"\x1b[<2;1;1m");
         assert_eq!(encode_mouse(ev(MouseEventKind::Down(MouseButton::Left)), 0, 0, false).unwrap(), b"\x1b[M !!");
         assert_eq!(encode_mouse(ev(MouseEventKind::Up(MouseButton::Left)), 0, 0, false).unwrap(), b"\x1b[M#!!");
+        assert_eq!(encode_mouse(ev(MouseEventKind::Drag(MouseButton::Left)), 0, 0, true).unwrap(), b"\x1b[<32;1;1M");
         assert!(encode_mouse(ev(MouseEventKind::Moved), 0, 0, true).is_none());
     }
 

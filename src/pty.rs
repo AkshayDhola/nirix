@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Child, Command};
 
 fn winsize(rows: u16, cols: u16) -> libc::winsize {
@@ -15,9 +16,9 @@ fn check(ret: libc::c_int) -> io::Result<()> {
     if ret < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
-/// Start `shell` in a new pty. Returns our end of the pty (read output,
-/// write input) and the shell process.
-pub fn spawn(shell: &str, rows: u16, cols: u16) -> io::Result<(File, Child)> {
+/// Start `shell` in a new pty, in `dir` if given. Returns our end of the pty
+/// (read output, write input) and the shell process.
+pub fn spawn(shell: &str, rows: u16, cols: u16, dir: Option<PathBuf>) -> io::Result<(File, Child)> {
     let (mut master, mut slave) = (0, 0);
     let ws = winsize(rows, cols);
     // SAFETY: the pointers are valid; null name and settings are allowed.
@@ -33,6 +34,9 @@ pub fn spawn(shell: &str, rows: u16, cols: u16) -> io::Result<(File, Child)> {
 
     let mut cmd = Command::new(shell);
     cmd.env("TERM", "xterm-256color").stdin(slave.try_clone()?).stdout(slave.try_clone()?).stderr(slave);
+    if let Some(dir) = dir {
+        cmd.current_dir(dir);
+    }
     // SAFETY: only calls that are safe between fork and exec.
     unsafe {
         cmd.pre_exec(|| {

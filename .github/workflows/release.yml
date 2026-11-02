@@ -1,0 +1,38 @@
+name: Rust CI CD
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build and release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: install rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: test
+        run: cargo test --locked
+      - name: build
+        run: cargo build --release --locked
+      - name: package
+        run: |
+            mkdir -p dist
+            tar -czf dist/nirix-linux-x86_64.tar.gz \
+            -C target/release nirix
+      - name: publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          files: dist/nirix-linux-x86_64.tar.gz
+          generate_release_notes: true
+          make_latest: true
