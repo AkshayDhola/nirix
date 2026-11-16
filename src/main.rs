@@ -8,13 +8,19 @@ mod pty;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::num::NonZeroU16;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use crossterm::style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use crossterm::style::{
+    Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor,
+};
 use crossterm::{cursor, queue, terminal};
 
 use config::Config;
@@ -45,6 +51,11 @@ const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l";
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// What ends a word for double-click (same as Alacritty).
 const WORD_SEP: &str = ",│`|:\"' ()[]{}<>\t";
+/// How often the status bar re-reads each pane's folder and program. Programs
+/// can start and stop without printing anything (`sleep 10`), so we can't wait for output.
+const POLL: Duration = Duration::from_millis(500);
+/// Longest folder name in the status bar; longer ones are cut with "…".
+const LABEL_DIR: usize = 20;
 
 /// What pane threads tell the main loop.
 enum Ev {
@@ -67,6 +78,8 @@ struct Pane {
     child: Child,
     /// Key presses for this pane, written to its shell by a helper thread.
     input: Sender<Vec<u8>>,
+    /// Status bar text, like "(nirix % vim)". Kept here so drawing never reads /proc.
+    label: String,
 }
 
 /// Keeps what an app copied (OSC 52, already base64) so we can pass it to the real terminal.
@@ -81,7 +94,7 @@ impl vt100::Callbacks for Clip {
 
 /// Text picked with the mouse, in one pane. Lines count from the oldest
 /// scrollback line, so the selection stays on its text while output scrolls.
-/// ponytail: drifts once scrollback is full and old lines drop off.
+/// Drifts once scrollback is full and old lines drop off.
 #[derive(Clone, Copy)]
 struct Sel {
     pane: u64,
@@ -125,14 +138,29 @@ const UNDERLINE: u8 = 4;
 const REVERSE: u8 = 8;
 
 impl Glyph {
-    const BLANK: Glyph = Glyph { text: [b' '; CELL_BYTES], len: 1, fg: Color::Reset, bg: Color::Reset, attrs: 0 };
-    const WIDE_TAIL: Glyph = Glyph { len: 0, ..Glyph::BLANK };
+    const BLANK: Glyph = Glyph {
+        text: [b' '; CELL_BYTES],
+        len: 1,
+        fg: Color::Reset,
+        bg: Color::Reset,
+        attrs: 0,
+    };
+    const WIDE_TAIL: Glyph = Glyph {
+        len: 0,
+        ..Glyph::BLANK
+    };
 
     fn new(s: &str, fg: Color, bg: Color, attrs: u8) -> Self {
         let mut text = [0; CELL_BYTES];
         let len = s.len().min(CELL_BYTES);
         text[..len].copy_from_slice(&s.as_bytes()[..len]);
-        Glyph { text, len: len as u8, fg, bg, attrs }
+        Glyph {
+            text,
+            len: len as u8,
+            fg,
+            bg,
+            attrs,
+        }
     }
 
     fn plain(c: char, fg: Color) -> Self {
@@ -178,7 +206,11 @@ impl Frame {
     fn number(&mut self, x: i32, y: i32, mut n: usize, fg: Color) -> i32 {
         let width = digits(n);
         for i in (0..width).rev() {
-            self.put(x + i, y, Glyph::plain(char::from_digit((n % 10) as u32, 10).unwrap(), fg));
+            self.put(
+                x + i,
+                y,
+                Glyph::plain(char::from_digit((n % 10) as u32, 10).unwrap(), fg),
+            );
             n /= 10;
         }
         width
@@ -234,7 +266,10 @@ fn spring(pos: f32, vel: f32, to: f32, omega: f32, t: f32) -> (f32, f32) {
 
 /// Start a helper thread with a small stack (the default is 2 MB each).
 fn small_thread(f: impl FnOnce() + Send + 'static) -> io::Result<()> {
-    thread::Builder::new().stack_size(THREAD_STACK).spawn(f).map(drop)
+    thread::Builder::new()
+        .stack_size(THREAD_STACK)
+        .spawn(f)
+        .map(drop)
 }
 
 fn nz(n: u16) -> NonZeroU16 {
@@ -246,11 +281,10 @@ fn digits(n: usize) -> i32 {
     n.checked_ilog10().unwrap_or(0) as i32 + 1
 }
 
-/// Which pane numbers fit in `room` cells: a range around `focus`, growing
-/// one step right then one step left so the focused number stays near the middle.
-/// Each number takes its digits plus one space.
-fn number_window(len: usize, focus: usize, room: i32) -> (usize, usize) {
-    let w = |i: usize| digits(i + 1) + 1;
+/// Which pane labels fit in `room` cells: a range around `focus`, growing
+/// one step right then one step left so the focused label stays near the middle.
+/// `w(i)` is how many cells label `i` takes, including the space after it.
+fn label_window(len: usize, focus: usize, room: i32, w: impl Fn(usize) -> i32) -> (usize, usize) {
     let (mut lo, mut hi, mut used) = (focus, focus, w(focus));
     loop {
         let mut grew = false;
@@ -270,15 +304,60 @@ fn number_window(len: usize, focus: usize, room: i32) -> (usize, usize) {
     }
 }
 
+/// Status bar text for a pane, like "(nirix % vim)": the folder's last part
+/// ("~" for home), then the program in front.
+fn label(dir: Option<&Path>, home: Option<&Path>, name: &str) -> String {
+    let dir = match dir {
+        None => "?".into(),
+        Some(d) if Some(d) == home => "~".into(),
+        Some(d) => d
+            .file_name()
+            .map_or_else(|| d.to_string_lossy(), |n| n.to_string_lossy()),
+    };
+    let dir: String = if dir.chars().count() > LABEL_DIR {
+        dir.chars().take(LABEL_DIR - 1).chain(['…']).collect()
+    } else {
+        dir.into_owned()
+    };
+    format!("({dir} % {name})")
+}
+
+/// Working folder of a process, if we may read it.
+fn cwd(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .filter(|d| d.is_dir())
+}
+
+/// The user's home folder, which the status bar shows as "~".
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Read a pane's label from /proc. None if its shell is already gone.
+/// The folder falls back to the shell's when the program's is off limits (like sudo's).
+fn describe(p: &Pane, home: Option<&Path>) -> Option<String> {
+    let pid = pty::foreground(&p.master).unwrap_or(p.child.id());
+    let name = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let dir = cwd(pid).or_else(|| cwd(p.child.id()));
+    Some(label(dir.as_deref(), home, name.trim_end()))
+}
+
 impl App {
     /// Box width for a share of the screen. Rounds down so columns plus gaps always fit.
     fn frac_w(&self, frac: f32) -> u16 {
-        (((self.w + GAP) as f32 * frac) as u16).saturating_sub(GAP).max(MIN_COL)
+        (((self.w + GAP) as f32 * frac) as u16)
+            .saturating_sub(GAP)
+            .max(MIN_COL)
     }
 
     /// A single pane takes the whole screen; otherwise each uses its own width.
     fn col_w(&self, p: &Pane) -> u16 {
-        if self.panes.len() == 1 { self.w.max(MIN_COL) } else { self.frac_w(p.frac) }
+        if self.panes.len() == 1 {
+            self.w.max(MIN_COL)
+        } else {
+            self.frac_w(p.frac)
+        }
     }
 
     /// Left edge of pane `i` on the strip.
@@ -297,13 +376,21 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.anim.as_ref().is_some_and(|a| a.start.elapsed() < self.cfg.animation_time)
+        self.anim
+            .as_ref()
+            .is_some_and(|a| a.start.elapsed() < self.cfg.animation_time)
     }
 
     /// Where the view is right now, and how fast it is moving.
     fn cam(&self) -> (f32, f32) {
         match &self.anim {
-            Some(a) if self.animating() => spring(a.pos, a.vel, self.view_x as f32, self.omega(), a.start.elapsed().as_secs_f32()),
+            Some(a) if self.animating() => spring(
+                a.pos,
+                a.vel,
+                self.view_x as f32,
+                self.omega(),
+                a.start.elapsed().as_secs_f32(),
+            ),
             _ => (self.view_x as f32, 0.0),
         }
     }
@@ -311,10 +398,14 @@ impl App {
     /// Start a shell in a new pane right of the focused one.
     fn spawn(&mut self) -> io::Result<()> {
         let frac = 0.5;
-        let cols = if self.panes.is_empty() { self.w.max(MIN_COL) } else { self.frac_w(frac) } - 2;
+        let cols = if self.panes.is_empty() {
+            self.w.max(MIN_COL)
+        } else {
+            self.frac_w(frac)
+        } - 2;
         let rows = self.rows();
         // Start where the focused shell is, like a normal terminal's new window.
-        let dir = self.panes.get(self.focus).and_then(|p| std::fs::read_link(format!("/proc/{}/cwd", p.child.id())).ok()).filter(|d| d.is_dir());
+        let dir = self.panes.get(self.focus).and_then(|p| cwd(p.child.id()));
         let (master, mut child) = pty::spawn(&self.cfg.shell, rows, cols, dir)?;
         // Take the id even if the next step fails, so a late Exit for it can't hit another pane.
         let id = self.next_id;
@@ -328,12 +419,42 @@ impl App {
             }
         };
 
-        let parser = vt100::Parser::new_with_callbacks(nz(rows), nz(cols), SCROLLBACK, Clip::default());
-        let pane = Pane { id, frac, parser, master, child, input };
-        let at = if self.panes.is_empty() { 0 } else { self.focus + 1 };
+        let parser =
+            vt100::Parser::new_with_callbacks(nz(rows), nz(cols), SCROLLBACK, Clip::default());
+        let mut pane = Pane {
+            id,
+            frac,
+            parser,
+            master,
+            child,
+            input,
+            label: String::new(),
+        };
+        // `Command::spawn` returns after exec, so this already names the shell.
+        pane.label = describe(&pane, home().as_deref()).unwrap_or_default();
+        let at = if self.panes.is_empty() {
+            0
+        } else {
+            self.focus + 1
+        };
         self.panes.insert(at, pane);
         self.focus = at;
         Ok(())
+    }
+
+    /// Re-read every pane's folder and program. Returns true if any label changed.
+    fn refresh(&mut self) -> bool {
+        let home = home();
+        let mut changed = false;
+        for p in &mut self.panes {
+            if let Some(l) = describe(p, home.as_deref())
+                && l != p.label
+            {
+                p.label = l;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Start a pane's two helper threads: one passes the shell's output to the
@@ -371,7 +492,9 @@ impl App {
 
     /// Drop a pane whose shell is gone; focus moves to its left neighbour.
     fn remove(&mut self, id: u64) {
-        let Some(i) = self.panes.iter().position(|p| p.id == id) else { return };
+        let Some(i) = self.panes.iter().position(|p| p.id == id) else {
+            return;
+        };
         let mut p = self.panes.remove(i);
         let _ = p.child.wait();
         if i < self.focus || self.focus >= self.panes.len() {
@@ -413,7 +536,11 @@ impl App {
                 // Start from the current position and speed, so a new slide
                 // during an old one continues smoothly instead of jumping.
                 let (pos, vel) = self.cam();
-                self.anim = Some(Anim { pos, vel, start: Instant::now() });
+                self.anim = Some(Anim {
+                    pos,
+                    vel,
+                    start: Instant::now(),
+                });
             }
             self.view_x = view_x;
         }
@@ -442,7 +569,10 @@ impl App {
             KeyCode::Char(c @ '1'..='9') => self.focus = (c as usize - '1' as usize).min(n - 1),
             KeyCode::Char('r') => {
                 let p = &mut self.panes[self.focus];
-                p.frac = *WIDTHS.iter().find(|&&f| f > p.frac + 0.01).unwrap_or(&WIDTHS[0]);
+                p.frac = *WIDTHS
+                    .iter()
+                    .find(|&&f| f > p.frac + 0.01)
+                    .unwrap_or(&WIDTHS[0]);
             }
             KeyCode::Char('m') => {
                 let p = &mut self.panes[self.focus];
@@ -475,7 +605,9 @@ impl App {
         }
         let p = &mut self.panes[self.focus];
         p.parser.screen_mut().set_scrollback(0);
-        let _ = p.input.send(encode(k, p.parser.screen().application_cursor()));
+        let _ = p
+            .input
+            .send(encode(k, p.parser.screen().application_cursor()));
     }
 
     /// Send pasted text in one go. Wrap it in paste markers if the app asked
@@ -504,7 +636,8 @@ impl App {
         (0..self.panes.len()).find_map(|i| {
             let (c, r) = self.cell_in(i, x, y);
             let inner = self.col_w(&self.panes[i]) as i32 - 2;
-            ((0..inner).contains(&c) && (0..self.rows() as i32).contains(&r)).then_some((i, c as u16, r as u16))
+            ((0..inner).contains(&c) && (0..self.rows() as i32).contains(&r))
+                .then_some((i, c as u16, r as u16))
         })
     }
 
@@ -515,12 +648,16 @@ impl App {
         let (i, col, row) = match m.kind {
             // Drags and the release go to the pane the button went down in, even past its edge.
             MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
-                let Some(i) = self.panes.iter().position(|p| Some(p.id) == self.held) else { return };
+                let Some(i) = self.panes.iter().position(|p| Some(p.id) == self.held) else {
+                    return;
+                };
                 let (c, r) = self.cell_in(i, m.column, m.row);
                 (i, c, r)
             }
             _ => {
-                let Some((i, c, r)) = self.pane_at(m.column, m.row) else { return };
+                let Some((i, c, r)) = self.pane_at(m.column, m.row) else {
+                    return;
+                };
                 (i, c as i32, r as i32)
             }
         };
@@ -555,7 +692,10 @@ impl App {
             // Mode Press wants no releases; only the motion modes want drags.
             let skip = match m.kind {
                 MouseEventKind::Up(_) => mode == MouseProtocolMode::Press,
-                MouseEventKind::Drag(_) => matches!(mode, MouseProtocolMode::Press | MouseProtocolMode::PressRelease),
+                MouseEventKind::Drag(_) => matches!(
+                    mode,
+                    MouseProtocolMode::Press | MouseProtocolMode::PressRelease
+                ),
                 _ => false,
             };
             let sgr = screen.mouse_protocol_encoding() == MouseProtocolEncoding::Sgr;
@@ -569,7 +709,9 @@ impl App {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let n = match self.last_click {
-                    Some((t, at, n)) if at == (m.column, m.row) && t.elapsed() < DOUBLE_CLICK => n % 3 + 1,
+                    Some((t, at, n)) if at == (m.column, m.row) && t.elapsed() < DOUBLE_CLICK => {
+                        n % 3 + 1
+                    }
                     _ => 1,
                 };
                 self.last_click = Some((Instant::now(), (m.column, m.row), n));
@@ -581,15 +723,22 @@ impl App {
                     }
                     3 => {
                         let (a, b) = line_rows(s, r);
-                        ((top + a as usize, 0), Some((top + b as usize, s.size().1.get() - 1)))
+                        (
+                            (top + a as usize, 0),
+                            Some((top + b as usize, s.size().1.get() - 1)),
+                        )
                     }
                     _ => ((top + r as usize, c), None),
                 };
-                self.sel = Some(Sel { pane: id, anchor, head });
+                self.sel = Some(Sel {
+                    pane: id,
+                    anchor,
+                    head,
+                });
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 // Past the top or bottom edge: scroll the history along.
-                // ponytail: one line per mouse move; add a timer if that feels slow.
+                // One line per mouse move; add a timer if that feels slow.
                 if row < 0 {
                     s.set_scrollback(s.scrollback() + 1);
                 } else if row >= rows {
@@ -599,18 +748,30 @@ impl App {
                     sel.head = Some((line_of(s, r), c));
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => match self.sel.filter(|x| x.pane == id).and_then(|x| x.range()) {
-                Some((a, b)) => self.clip = Some(base64(selected_text(s, a, b).as_bytes())),
-                None => self.sel = None,
-            },
+            MouseEventKind::Up(MouseButton::Left) => {
+                match self.sel.filter(|x| x.pane == id).and_then(|x| x.range()) {
+                    Some((a, b)) => self.clip = Some(base64(selected_text(s, a, b).as_bytes())),
+                    None => self.sel = None,
+                }
+            }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = m.kind == MouseEventKind::ScrollUp;
                 if s.alternate_screen() {
-                    let key = encode(KeyEvent::new(if up { KeyCode::Up } else { KeyCode::Down }, KeyModifiers::NONE), s.application_cursor());
+                    let key = encode(
+                        KeyEvent::new(
+                            if up { KeyCode::Up } else { KeyCode::Down },
+                            KeyModifiers::NONE,
+                        ),
+                        s.application_cursor(),
+                    );
                     let _ = p.input.send(key.repeat(WHEEL_LINES));
                 } else {
                     let n = s.scrollback();
-                    s.set_scrollback(if up { n + WHEEL_LINES } else { n.saturating_sub(WHEEL_LINES) });
+                    s.set_scrollback(if up {
+                        n + WHEEL_LINES
+                    } else {
+                        n.saturating_sub(WHEEL_LINES)
+                    });
                 }
             }
             _ => {}
@@ -657,7 +818,11 @@ impl App {
                 continue; // fully off screen
             }
 
-            let fg = if i == self.focus { self.cfg.focus_color } else { self.cfg.border_color };
+            let fg = if i == self.focus {
+                self.cfg.focus_color
+            } else {
+                self.cfg.border_color
+            };
             let (lx, rx) = (x0, x0 + w - 1);
             for (y, l, r) in [(0, '┌', '┐'), (rows + 1, '└', '┘')] {
                 f.put(lx, y, Glyph::plain(l, fg));
@@ -681,7 +846,9 @@ impl App {
                     if !(0..sw).contains(&sx) {
                         continue;
                     }
-                    let Some(cell) = screen.cell(y as u16, c as u16) else { break };
+                    let Some(cell) = screen.cell(y as u16, c as u16) else {
+                        break;
+                    };
                     if cell.is_wide_continuation() {
                         // Its left half draws this cell. If the left half is off
                         // screen, leave a blank here instead.
@@ -690,27 +857,40 @@ impl App {
                         }
                         continue;
                     }
-                    let selected = sel.is_some_and(|(a, b)| (a..=b).contains(&(top + y as usize, c as u16)));
+                    let selected =
+                        sel.is_some_and(|(a, b)| (a..=b).contains(&(top + y as usize, c as u16)));
                     let attrs = (cell.bold() as u8 * BOLD)
                         | (cell.italic() as u8 * ITALIC)
                         | (cell.underline() as u8 * UNDERLINE)
                         | ((cell.inverse() != selected) as u8 * REVERSE);
                     // A wide character with no room for its right half becomes a blank.
                     let cut = cell.is_wide() && (c + 1 >= inner || sx + 1 >= sw);
-                    let s = if cut || cell.contents().is_empty() { " " } else { cell.contents() };
-                    f.put(sx, y + 1, Glyph::new(s, color(cell.fgcolor()), color(cell.bgcolor()), attrs));
+                    let s = if cut || cell.contents().is_empty() {
+                        " "
+                    } else {
+                        cell.contents()
+                    };
+                    f.put(
+                        sx,
+                        y + 1,
+                        Glyph::new(s, color(cell.fgcolor()), color(cell.bgcolor()), attrs),
+                    );
                 }
             }
         }
 
-        // Status bar: pane numbers, focused one highlighted. If they don't all
-        // fit, show the ones around the focus and "+N" for how many are hidden
-        // on each side.
+        // Status bar: each pane's folder and program, focused one highlighted.
+        // If they don't all fit, show the ones around the focus and "+N" for
+        // how many are hidden on each side.
+        // One char per cell, so wide or combining chars in a folder
+        // name (CJK, Devanagari vowel signs) shift the rest of the bar. Doing
+        // better needs unicode width tables, which we don't pull in.
         let y = self.h as i32 - 1;
         let n = self.panes.len();
         // Room for the "+N " counts on both sides.
         let counts = 2 * (digits(n) + 2);
-        let (lo, hi) = number_window(n, self.focus, sw - 2 - counts);
+        let width = |i: usize| self.panes[i].label.chars().count() as i32 + 1;
+        let (lo, hi) = label_window(n, self.focus, sw - 2 - counts, width);
         let dim = self.cfg.border_color;
         let mut x = 1;
         if lo > 0 {
@@ -718,8 +898,13 @@ impl App {
             x += f.number(x + 1, y, lo, dim) + 2;
         }
         for i in lo..=hi {
-            let fg = if i == self.focus { self.cfg.focus_color } else { dim };
-            x += f.number(x, y, i + 1, fg) + 1;
+            let fg = if i == self.focus {
+                self.cfg.focus_color
+            } else {
+                dim
+            };
+            f.text(x, y, &self.panes[i].label, fg);
+            x += width(i);
         }
         if hi + 1 < n {
             f.put(x, y, Glyph::plain('+', dim));
@@ -738,7 +923,11 @@ impl App {
         queue!(out, terminal::BeginSynchronizedUpdate, cursor::Hide)?;
         if (self.prev.w, self.prev.h) != (f.w, f.h) {
             // New size: clear everything and repaint from scratch.
-            queue!(out, SetAttribute(Attribute::Reset), terminal::Clear(terminal::ClearType::All))?;
+            queue!(
+                out,
+                SetAttribute(Attribute::Reset),
+                terminal::Clear(terminal::ClearType::All)
+            )?;
             self.prev.reset(f.w, f.h);
         }
 
@@ -755,8 +944,18 @@ impl App {
             }
             let st = (g.fg, g.bg, g.attrs);
             if style != Some(st) {
-                queue!(out, SetAttribute(Attribute::Reset), SetForegroundColor(g.fg), SetBackgroundColor(g.bg))?;
-                for (bit, a) in [(BOLD, Attribute::Bold), (ITALIC, Attribute::Italic), (UNDERLINE, Attribute::Underlined), (REVERSE, Attribute::Reverse)] {
+                queue!(
+                    out,
+                    SetAttribute(Attribute::Reset),
+                    SetForegroundColor(g.fg),
+                    SetBackgroundColor(g.bg)
+                )?;
+                for (bit, a) in [
+                    (BOLD, Attribute::Bold),
+                    (ITALIC, Attribute::Italic),
+                    (UNDERLINE, Attribute::Underlined),
+                    (REVERSE, Attribute::Reverse),
+                ] {
                     if g.attrs & bit != 0 {
                         queue!(out, SetAttribute(a))?;
                     }
@@ -806,7 +1005,10 @@ fn encode(k: KeyEvent, app_cursor: bool) -> Vec<u8> {
         out.push(0x1b);
     }
     // xterm modifier number: 1 + shift + 2*alt + 4*ctrl
-    let mods = 1 + m.contains(KeyModifiers::SHIFT) as u8 + 2 * m.contains(KeyModifiers::ALT) as u8 + 4 * m.contains(KeyModifiers::CONTROL) as u8;
+    let mods = 1
+        + m.contains(KeyModifiers::SHIFT) as u8
+        + 2 * m.contains(KeyModifiers::ALT) as u8
+        + 4 * m.contains(KeyModifiers::CONTROL) as u8;
     // Arrows, Home and End. Apps like vim ask for the "application" form.
     let csi = |c: char| -> Vec<u8> {
         if mods > 1 {
@@ -866,9 +1068,18 @@ fn encode_mouse(m: MouseEvent, col: u16, row: u16, sgr: bool) -> Option<Vec<u8>>
         _ => return None,
     };
     let mods = m.modifiers;
-    let code = code + 4 * mods.contains(KeyModifiers::SHIFT) as u8 + 8 * mods.contains(KeyModifiers::ALT) as u8 + 16 * mods.contains(KeyModifiers::CONTROL) as u8;
+    let code = code
+        + 4 * mods.contains(KeyModifiers::SHIFT) as u8
+        + 8 * mods.contains(KeyModifiers::ALT) as u8
+        + 16 * mods.contains(KeyModifiers::CONTROL) as u8;
     Some(if sgr {
-        format!("\x1b[<{code};{};{}{}", col + 1, row + 1, if release { 'm' } else { 'M' }).into_bytes()
+        format!(
+            "\x1b[<{code};{};{}{}",
+            col + 1,
+            row + 1,
+            if release { 'm' } else { 'M' }
+        )
+        .into_bytes()
     } else {
         // The old form can't say which button was let go, and can't reach past cell 222.
         let code = if release { code | 3 } else { code };
@@ -880,7 +1091,13 @@ fn encode_mouse(m: MouseEvent, col: u16, row: u16, sgr: bool) -> Option<Vec<u8>>
 /// SGR code that sets exactly this cell's colors and style.
 fn sgr(c: &vt100::Cell) -> String {
     let mut out = String::from("\x1b[0");
-    for (on, code) in [(c.bold(), ";1"), (c.dim(), ";2"), (c.italic(), ";3"), (c.underline(), ";4"), (c.inverse(), ";7")] {
+    for (on, code) in [
+        (c.bold(), ";1"),
+        (c.dim(), ";2"),
+        (c.italic(), ";3"),
+        (c.underline(), ";4"),
+        (c.inverse(), ";7"),
+    ] {
         if on {
             out.push_str(code);
         }
@@ -899,7 +1116,11 @@ fn sgr(c: &vt100::Cell) -> String {
 /// Rebuild a screen at a new size so long lines wrap to the new width, like a
 /// real terminal. vt100 only cuts or pads rows, so we replay the old text
 /// (scrollback included) into a new parser.
-fn reflow<CB: vt100::Callbacks + Default>(old: &mut vt100::Parser<CB>, rows: u16, cols: u16) -> vt100::Parser<CB> {
+fn reflow<CB: vt100::Callbacks + Default>(
+    old: &mut vt100::Parser<CB>,
+    rows: u16,
+    cols: u16,
+) -> vt100::Parser<CB> {
     let s = old.screen_mut();
     let (h, w) = (s.size().0.get() as usize, s.size().1.get());
     let sb = s.scrollback_len();
@@ -919,8 +1140,16 @@ fn reflow<CB: vt100::Callbacks + Default>(old: &mut vt100::Parser<CB>, rows: u16
         for r in (top - first) as u16..h as u16 {
             let at_cursor = first + r as usize == cursor;
             let wrapped = s.row_wrapped(r);
-            let shown = |c| s.cell(r, c).is_some_and(|x| x.has_contents() || x.bgcolor() != vt100::Color::Default || x.inverse());
-            let end = if wrapped { w } else { (0..w).rev().find(|&c| shown(c)).map_or(0, |c| c + 1) };
+            let shown = |c| {
+                s.cell(r, c).is_some_and(|x| {
+                    x.has_contents() || x.bgcolor() != vt100::Color::Default || x.inverse()
+                })
+            };
+            let end = if wrapped {
+                w
+            } else {
+                (0..w).rev().find(|&c| shown(c)).map_or(0, |c| c + 1)
+            };
             for c in 0..end.max(if at_cursor { cx + 1 } else { 0 }) {
                 if at_cursor && c == cx {
                     text.push_str(&"\r\n".repeat(std::mem::take(&mut breaks)));
@@ -934,12 +1163,24 @@ fn reflow<CB: vt100::Callbacks + Default>(old: &mut vt100::Parser<CB>, rows: u16
                     continue;
                 }
                 text.push_str(&"\r\n".repeat(std::mem::take(&mut breaks)));
-                let key = (cell.fgcolor(), cell.bgcolor(), cell.bold(), cell.dim(), cell.italic(), cell.underline(), cell.inverse());
+                let key = (
+                    cell.fgcolor(),
+                    cell.bgcolor(),
+                    cell.bold(),
+                    cell.dim(),
+                    cell.italic(),
+                    cell.underline(),
+                    cell.inverse(),
+                );
                 if style != Some(key) {
                     text.push_str(&sgr(cell));
                     style = Some(key);
                 }
-                text.push_str(if cell.has_contents() { cell.contents() } else { " " });
+                text.push_str(if cell.has_contents() {
+                    cell.contents()
+                } else {
+                    " "
+                });
             }
             if !wrapped {
                 breaks += 1;
@@ -955,10 +1196,16 @@ fn reflow<CB: vt100::Callbacks + Default>(old: &mut vt100::Parser<CB>, rows: u16
     let before = new.screen().scrollback_len();
     new.process(&text.as_bytes()[split..]);
     // Text after the cursor may have scrolled the screen up.
-    // ponytail: miscounts once scrollback is full; only matters for text below the cursor.
+    // Miscounts once scrollback is full; only matters for text below the cursor.
     let r = (r as usize).saturating_sub(new.screen().scrollback_len() - before);
     let hide = if s.hide_cursor() { "\x1b[?25l" } else { "" };
-    let restore = format!("\x1b[0m{}{}{hide}\x1b[{};{}H", s.attributes_formatted(), s.input_mode_formatted(), r + 1, c + 1);
+    let restore = format!(
+        "\x1b[0m{}{}{hide}\x1b[{};{}H",
+        s.attributes_formatted(),
+        s.input_mode_formatted(),
+        r + 1,
+        c + 1
+    );
     new.process(restore.as_bytes());
     new
 }
@@ -985,7 +1232,11 @@ fn line_rows(s: &vt100::Screen, row: u16) -> (u16, u16) {
 /// First and last column of the word at (`row`, `col`). Off a word, just that cell.
 fn word_at(s: &vt100::Screen, row: u16, col: u16) -> (u16, u16) {
     let w = s.size().1.get();
-    let word = |c| s.cell(row, c).is_some_and(|x| x.is_wide_continuation() || (x.has_contents() && !WORD_SEP.contains(x.contents())));
+    let word = |c| {
+        s.cell(row, c).is_some_and(|x| {
+            x.is_wide_continuation() || (x.has_contents() && !WORD_SEP.contains(x.contents()))
+        })
+    };
     if !word(col) {
         return (col, col);
     }
@@ -1001,11 +1252,18 @@ fn selected_text(s: &mut vt100::Screen, a: (usize, u16), b: (usize, u16)) -> Str
     let mut out = String::new();
     for line in a.0..=b.0 {
         // Bring the line on screen: the top row while it is in the history.
-        let (off, row) = if line < sb { (sb - line, 0) } else { (0, line - sb) };
+        let (off, row) = if line < sb {
+            (sb - line, 0)
+        } else {
+            (0, line - sb)
+        };
         s.set_scrollback(off);
         let c0 = if line == a.0 { a.1 } else { 0 };
         let c1 = if line == b.0 { b.1 + 1 } else { w };
-        let text = s.rows(c0, c1.saturating_sub(c0)).nth(row).unwrap_or_default();
+        let text = s
+            .rows(c0, c1.saturating_sub(c0))
+            .nth(row)
+            .unwrap_or_default();
         let wrapped = s.row_wrapped(row as u16);
         out.push_str(if wrapped { &text } else { text.trim_end() });
         if line != b.0 && !wrapped {
@@ -1021,9 +1279,16 @@ fn base64(data: &[u8]) -> String {
     const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | ((b as u32) << (16 - 8 * i)));
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | ((b as u32) << (16 - 8 * i)));
         for i in 0..4 {
-            out.push(if i <= chunk.len() { ABC[((n >> (18 - 6 * i)) & 63) as usize] as char } else { '=' });
+            out.push(if i <= chunk.len() {
+                ABC[((n >> (18 - 6 * i)) & 63) as usize] as char
+            } else {
+                '='
+            });
         }
     }
     out
@@ -1045,19 +1310,36 @@ fn url_at(s: &vt100::Screen, row: u16, col: u16) -> Option<String> {
     if line.get(at).is_none_or(|&b| b == b' ') {
         return None;
     }
-    let start = line[..at].iter().rposition(|&b| b == b' ').map_or(0, |i| i + 1);
-    let end = line[at..].iter().position(|&b| b == b' ').map_or(line.len(), |i| at + i);
+    let start = line[..at]
+        .iter()
+        .rposition(|&b| b == b' ')
+        .map_or(0, |i| i + 1);
+    let end = line[at..]
+        .iter()
+        .position(|&b| b == b' ')
+        .map_or(line.len(), |i| at + i);
     let word = std::str::from_utf8(&line[start..end]).ok()?;
     let i = word.find("://")?;
-    let scheme = word[..i].rfind(|c: char| !c.is_ascii_alphanumeric()).map_or(0, |j| j + 1);
+    let scheme = word[..i]
+        .rfind(|c: char| !c.is_ascii_alphanumeric())
+        .map_or(0, |j| j + 1);
     let url = word[scheme..].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']']);
     (i > scheme && url.len() > i - scheme + 3).then(|| url.to_string())
 }
 
 /// Open a link with the desktop's default app, in the background.
 fn open_url(url: &str) -> io::Result<()> {
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    let mut child = Command::new(opener).arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let mut child = Command::new(opener)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
     // Reap it so it doesn't linger as a zombie.
     small_thread(move || {
         let _ = child.wait();
@@ -1067,7 +1349,13 @@ fn open_url(url: &str) -> io::Result<()> {
 /// Give the user's terminal back in its normal state.
 fn restore() {
     let _ = terminal::disable_raw_mode();
-    let _ = crossterm::execute!(io::stdout(), Print(MOUSE_OFF), event::DisableBracketedPaste, terminal::LeaveAlternateScreen, cursor::Show);
+    let _ = crossterm::execute!(
+        io::stdout(),
+        Print(MOUSE_OFF),
+        event::DisableBracketedPaste,
+        terminal::LeaveAlternateScreen,
+        cursor::Show
+    );
 }
 
 fn main() -> io::Result<()> {
@@ -1098,7 +1386,12 @@ fn main() -> io::Result<()> {
     app.spawn()?;
 
     terminal::enable_raw_mode()?;
-    crossterm::execute!(io::stdout(), terminal::EnterAlternateScreen, event::EnableBracketedPaste, Print(MOUSE_ON))?;
+    crossterm::execute!(
+        io::stdout(),
+        terminal::EnterAlternateScreen,
+        event::EnableBracketedPaste,
+        Print(MOUSE_ON)
+    )?;
     // Fix the terminal even if we crash.
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -1124,6 +1417,7 @@ fn main() -> io::Result<()> {
         // stop the screen from updating or the other from being handled.
         let mut dirty = true;
         let mut last_draw: Option<Instant> = None;
+        let mut next_poll = Instant::now();
         loop {
             // Keys first, so they never wait behind output.
             let got_key = match keys.try_recv() {
@@ -1138,6 +1432,10 @@ fn main() -> io::Result<()> {
                 break; // last shell exited
             }
             let now = Instant::now();
+            if now >= next_poll {
+                dirty |= app.refresh();
+                next_poll = now + POLL;
+            }
             let due = last_draw.map_or(now, |t| t + FRAME);
             let busy = dirty || app.animating();
             if busy && now >= due {
@@ -1157,18 +1455,13 @@ fn main() -> io::Result<()> {
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => break,
             }
-            // Nothing waiting: sleep until something arrives or the next draw is due.
-            let ev = if busy {
-                match rx.recv_timeout(due - now) {
-                    Ok(e) => e,
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => break,
-                }
-            } else {
-                match rx.recv() {
-                    Ok(e) => e,
-                    Err(_) => break,
-                }
+            // Nothing waiting: sleep until something arrives, the next draw is
+            // due, or it's time to re-read the status bar labels.
+            let wake = if busy { due.min(next_poll) } else { next_poll };
+            let ev = match rx.recv_timeout(wake.saturating_duration_since(now)) {
+                Ok(e) => e,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
             };
             app.handle(ev);
             dirty = true;
@@ -1181,11 +1474,18 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, Glyph, base64, encode_mouse, line_of, number_window, nz, reflow, scroll_to, selected_text, spring, url_at, word_at};
+    use super::{
+        Frame, Glyph, base64, encode_mouse, label, label_window, line_of, nz, reflow, scroll_to,
+        selected_text, spring, url_at, word_at,
+    };
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use std::path::Path;
 
     fn rows(p: &vt100::Parser) -> Vec<String> {
-        p.screen().rows(0, 100).map(|r| r.trim_end().to_string()).collect()
+        p.screen()
+            .rows(0, 100)
+            .map(|r| r.trim_end().to_string())
+            .collect()
     }
 
     #[test]
@@ -1238,28 +1538,70 @@ mod tests {
     }
 
     #[test]
-    fn numbers_window() {
+    fn labels_window() {
+        // labels of mixed widths, 8 to 17 cells
+        let w = |i: usize| 8 + (i % 10) as i32;
         // everything fits
-        assert_eq!(number_window(3, 1, 80), (0, 2));
-        // 40 panes, room for 10 two-digit numbers: focus 20 (shown as 21) stays inside
-        let (lo, hi) = number_window(40, 20, 30);
+        assert_eq!(label_window(3, 1, 80, w), (0, 2));
+        // 40 panes, room for about 3: focus 20 stays inside
+        let (lo, hi) = label_window(40, 20, 40, w);
         assert!(lo <= 20 && 20 <= hi && lo > 0 && hi < 39);
-        let used: i32 = (lo..=hi).map(|i| super::digits(i + 1) + 1).sum();
-        assert!(used <= 30);
+        let used: i32 = (lo..=hi).map(w).sum();
+        assert!(used <= 40);
         // focus at the ends
-        assert_eq!(number_window(40, 0, 10).0, 0);
-        assert_eq!(number_window(40, 39, 10).1, 39);
+        assert_eq!(label_window(40, 0, 30, w).0, 0);
+        assert_eq!(label_window(40, 39, 30, w).1, 39);
+        // a focused label wider than the room is still shown, alone
+        assert_eq!(label_window(5, 2, 4, w), (2, 2));
+    }
+
+    #[test]
+    fn labels() {
+        let home = Some(Path::new("/home/u"));
+        assert_eq!(label(Some(Path::new("/home/u")), home, "zsh"), "(~ % zsh)");
+        assert_eq!(label(Some(Path::new("/")), home, "zsh"), "(/ % zsh)");
+        assert_eq!(
+            label(Some(Path::new("/home/u/nirix")), home, "vim"),
+            "(nirix % vim)"
+        );
+        assert_eq!(label(None, home, "zsh"), "(? % zsh)");
+        let long = label(
+            Some(Path::new("/srv/a-very-long-folder-name-here")),
+            home,
+            "zsh",
+        );
+        assert_eq!(long, "(a-very-long-folder-… % zsh)");
     }
     use crossterm::style::Color;
 
     #[test]
     fn mouse_bytes() {
-        let ev = |kind| MouseEvent { kind, column: 0, row: 0, modifiers: KeyModifiers::NONE };
-        assert_eq!(encode_mouse(ev(MouseEventKind::ScrollUp), 4, 2, true).unwrap(), b"\x1b[<64;5;3M");
-        assert_eq!(encode_mouse(ev(MouseEventKind::Up(MouseButton::Right)), 0, 0, true).unwrap(), b"\x1b[<2;1;1m");
-        assert_eq!(encode_mouse(ev(MouseEventKind::Down(MouseButton::Left)), 0, 0, false).unwrap(), b"\x1b[M !!");
-        assert_eq!(encode_mouse(ev(MouseEventKind::Up(MouseButton::Left)), 0, 0, false).unwrap(), b"\x1b[M#!!");
-        assert_eq!(encode_mouse(ev(MouseEventKind::Drag(MouseButton::Left)), 0, 0, true).unwrap(), b"\x1b[<32;1;1M");
+        let ev = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            encode_mouse(ev(MouseEventKind::ScrollUp), 4, 2, true).unwrap(),
+            b"\x1b[<64;5;3M"
+        );
+        assert_eq!(
+            encode_mouse(ev(MouseEventKind::Up(MouseButton::Right)), 0, 0, true).unwrap(),
+            b"\x1b[<2;1;1m"
+        );
+        assert_eq!(
+            encode_mouse(ev(MouseEventKind::Down(MouseButton::Left)), 0, 0, false).unwrap(),
+            b"\x1b[M !!"
+        );
+        assert_eq!(
+            encode_mouse(ev(MouseEventKind::Up(MouseButton::Left)), 0, 0, false).unwrap(),
+            b"\x1b[M#!!"
+        );
+        assert_eq!(
+            encode_mouse(ev(MouseEventKind::Drag(MouseButton::Left)), 0, 0, true).unwrap(),
+            b"\x1b[<32;1;1M"
+        );
         assert!(encode_mouse(ev(MouseEventKind::Moved), 0, 0, true).is_none());
     }
 
@@ -1300,6 +1642,9 @@ mod tests {
         f.put(2, 0, Glyph::plain('é', Color::Reset));
         let s: String = f.cells.iter().map(Glyph::as_str).collect();
         assert_eq!(s, "42é       ");
-        assert_eq!(Glyph::new("e\u{301}", Color::Reset, Color::Reset, 0).as_str(), "e\u{301}");
+        assert_eq!(
+            Glyph::new("e\u{301}", Color::Reset, Color::Reset, 0).as_str(),
+            "e\u{301}"
+        );
     }
 }

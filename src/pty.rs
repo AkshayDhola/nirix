@@ -8,12 +8,21 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 
 fn winsize(rows: u16, cols: u16) -> libc::winsize {
-    libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 }
+    libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    }
 }
 
 /// Turn a libc return code into an error when it failed.
 fn check(ret: libc::c_int) -> io::Result<()> {
-    if ret < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Start `shell` in a new pty, in `dir` if given. Returns our end of the pty
@@ -22,7 +31,15 @@ pub fn spawn(shell: &str, rows: u16, cols: u16, dir: Option<PathBuf>) -> io::Res
     let (mut master, mut slave) = (0, 0);
     let ws = winsize(rows, cols);
     // SAFETY: the pointers are valid; null name and settings are allowed.
-    check(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &ws) })?;
+    check(unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &ws,
+        )
+    })?;
     // SAFETY: openpty just made these fds and nothing else owns them.
     let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
     // Don't let later shells inherit these. If they did, a closed pane
@@ -33,7 +50,10 @@ pub fn spawn(shell: &str, rows: u16, cols: u16, dir: Option<PathBuf>) -> io::Res
     }
 
     let mut cmd = Command::new(shell);
-    cmd.env("TERM", "xterm-256color").stdin(slave.try_clone()?).stdout(slave.try_clone()?).stderr(slave);
+    cmd.env("TERM", "xterm-256color")
+        .stdin(slave.try_clone()?)
+        .stdout(slave.try_clone()?)
+        .stderr(slave);
     if let Some(dir) = dir {
         cmd.current_dir(dir);
     }
@@ -54,6 +74,14 @@ pub fn resize(master: &File, rows: u16, cols: u16) -> io::Result<()> {
     let ws = winsize(rows, cols);
     // SAFETY: fd is an open pty, ws lives through the call.
     check(unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ as _, &ws) })
+}
+
+/// The process group in front on the pty: the shell at its prompt, or
+/// whatever it is running (vim, cargo, ...). Its leader's pid is the group id.
+pub fn foreground(master: &File) -> Option<u32> {
+    // SAFETY: fd is an open pty; the call only reads.
+    let pgrp = unsafe { libc::tcgetpgrp(master.as_raw_fd()) };
+    (pgrp > 0).then_some(pgrp as u32)
 }
 
 /// Ask the shell to quit, like closing a terminal window does (SIGHUP).

@@ -3,6 +3,7 @@
 A scrolling terminal multiplexer, inspired by [niri](https://github.com/niri-wm/niri).
 
 Each terminal is a column. New terminals open to the right, and the view scrolls to them.
+The bar at the bottom shows each terminal's folder and running program, like `(nirix % vim)`.
 
 ## Install
 
